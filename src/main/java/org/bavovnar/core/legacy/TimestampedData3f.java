@@ -1,8 +1,9 @@
-package dataTypes;
+package org.bavovnar.core.legacy;
 
-import main.Main;
+import org.hipparchus.geometry.euclidean.threed.Vector3D;
 
 import java.io.Serializable;
+import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
@@ -32,7 +33,12 @@ public class TimestampedData3f extends Data3f implements Serializable
      */
     public TimestampedData3f(float x, float y, float z)
     {
-        this(x, y, z, Main.getMain().getClock().instant());
+        this(x, y, z, Clock.systemUTC().instant());
+    }
+
+    public TimestampedData3f(Vector3D  v)
+    {
+        this((float) v.getX(), (float) v.getY(), (float) v.getZ(), Clock.systemUTC().instant());
     }
 
     /**
@@ -60,7 +66,7 @@ public class TimestampedData3f extends Data3f implements Serializable
     public TimestampedData3f()
     {
         super();
-        instant = Main.getMain().getClock().instant();
+        instant = Clock.systemUTC().instant();
     }
 
     /**
@@ -100,6 +106,11 @@ public class TimestampedData3f extends Data3f implements Serializable
     public String toCSV()
     {
         return 	this.getTime() + "," + super.toCSV();
+    }
+
+    public Data3f toData3f()
+    {
+        return 	new Data3f(this);
     }
     
     /**

@@ -1,7 +1,7 @@
-package inertialNavigation;
+package org.bavovnar.navigation;
 
-import dataTypes.Data3f;
-import dataTypes.TimestampedData3f;
+import org.bavovnar.core.legacy.Data3f;
+import org.bavovnar.core.legacy.TimestampedData3f;
 
 /**
  * SensorFusion

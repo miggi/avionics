@@ -1,4 +1,4 @@
-package com.diozero.devices.imu.invensense;
+package org.bavovnar.device.constants;
 
 /*
  * #%L

@@ -1,8 +1,7 @@
 package org.bavovnar.device;
 
 import com.diozero.devices.imu.invensense.*;
-import org.bavovnar.device.constants.AK8963Constants;
-import org.bavovnar.device.constants.IMU9255Constants;
+import org.bavovnar.device.constants.*;
 import org.tinylog.Logger;
 
 import com.diozero.api.DeviceInterface;
@@ -11,9 +10,12 @@ import com.diozero.api.RuntimeIOException;
 import com.diozero.util.SleepUtil;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 
 @SuppressWarnings("unused")
-public class IMU9255Driver implements DeviceInterface, IMU9255Constants, AK8963Constants {
+public class MPU9255Driver implements DeviceInterface, MPU9255Constants, AK8963Constants {
     private static final byte AKM_DATA_READY = 0x01;
     private static final byte AKM_DATA_OVERRUN = 0x02;
     private static final byte AKM_OVERFLOW = (byte) 0x80;
@@ -22,65 +24,40 @@ public class IMU9255Driver implements DeviceInterface, IMU9255Constants, AK8963C
     private static final int MAX_PACKET_LENGTH = 12;
     private static final int MPU6050_TEMP_OFFSET = -521;
     private static final int MPU6500_TEMP_OFFSET = 0;
-    private static final int MAX_FIFO = 1024;
     private static final int MPU6050_TEMP_SENS = 340;
     private static final int MPU6500_TEMP_SENS = 321;
-
-    private int devAddress;
-    /* Matches gyro_cfg >> 3 & 0x03 */
-    private GyroFullScaleRange gyro_fsr;
+    private final AK8963MagScale magScale = AK8963MagScale.MFS_16BIT;
+    private final AK8963MagMode magMode = AK8963MagMode.MM_100HZ;
+    private GyroFullScaleRange gyroScaleRange;
     /* Matches accel_cfg >> 3 & 0x03 */
     private AccelFullScaleRange accel_fsr;
-    /* Enabled sensors. Uses same masks as fifo_en, NOT pwr_mgmt_2. */
-    private byte sensors;
-    private LowPassFilter lpf;
-    private ClockSource clk_src;
     /* Sample rate, NOT rate divider. */
     private int sample_rate;
-    /* Matches fifo_en register. */
-    private byte fifo_enable;
     /* Matches int enable register. */
     private boolean int_enable;
-    /* true if devices on auxiliary I2C bus appear on the primary. */
-    private Boolean bypass_mode;
-    /*
-     * true if half-sensitivity. NOTE: This doesn't belong here, but everything else in hw_s
-     * is const, and this allows us to save some precious RAM.
-     */
-    private boolean lp_accel_mode;
-    /* true if interrupts are only triggered on motion events. */
-    private boolean int_motion_only;
-    // struct motion_int_cache_s cache;
-    /* true for active low interrupts. */
-    private boolean active_low_int;
-    /* true for latched interrupts. */
-    private boolean latched_int;
-    /* true if DMP is enabled. */
-    private boolean dmp_on;
-    /* Ensures that DMP will only be loaded once. */
-    private boolean dmp_loaded;
+
     /* Sampling rate used when DMP is enabled. */
-    private int dmp_sample_rate;
-    /* Compass sample rate. */
-    private int compass_sample_rate;
+    private int magnetometerSampleRate;
+
     private byte compass_addr;
     private AK8975Driver magSensor;
-    private I2CDevice i2cDevice;
+    private final I2CDevice i2cDevice;
 
-    private float[] magCalibration;
+    private final I2CDevice i2cDeviceAK8963;
 
-    private float[] gyroCalibration;
-
-    private float[] accCalibration;
+    private float[] magFactoryCalibration;
+    private float[] magCalibration = new float[]{0.0f, 0.0f, 0.0f};
+    private float[] gyroCalibration = new float[]{0.0f, 0.0f, 0.0f};
+    private float[] accCalibration = new float[]{0.0f, 0.0f, 0.0f};
 
     /**
      * Default constructor, uses default I2C address.
      *
-     * @throws RuntimeIOException if an I/O error occurs
      * @param controller I2C controller
+     * @throws RuntimeIOException if an I/O error occurs
      */
-    public IMU9255Driver(int controller) throws RuntimeIOException {
-        this(controller, MPU9255_ADDRESS);
+    public MPU9255Driver(int controller) throws RuntimeIOException {
+        this(controller, MPU9255_ADDRESS, AK8963_ADDRESS);
     }
 
     /**
@@ -90,9 +67,9 @@ public class IMU9255Driver implements DeviceInterface, IMU9255Constants, AK8963C
      * @param devAddress address I2C address
      * @throws RuntimeIOException if an I/O error occurs
      */
-    public IMU9255Driver(int controller, int devAddress) throws RuntimeIOException {
+    public MPU9255Driver(int controller, int devAddress, int magAddress) throws RuntimeIOException {
         i2cDevice = I2CDevice.builder(devAddress).setController(controller).build();
-        this.devAddress = devAddress;
+        i2cDeviceAK8963 = I2CDevice.builder(magAddress).setController(controller).build();
     }
 
     @Override
@@ -105,16 +82,13 @@ public class IMU9255Driver implements DeviceInterface, IMU9255Constants, AK8963C
 
     /**
      * Initialize hardware. Initial configuration:
-     *
-     *   Gyro FSR: +/- 2000DPS Accel FSR +/- 2G
-     *   DLPF: 42Hz
-     *   FIFO rate: 50Hz
-     *   Clock source: Gyro PLL FIFO: Disabled.
-     *   Data ready interrupt: Disabled, active low, unlatched.
+     * <p>
+     * Gyro FSR: +/- 250DPS Accel FSR +/- 2G
+     * Data ready interrupt: Disabled, active low, unlatched.
      *
      * @throws RuntimeIOException if an I/O error occurs
      */
-    public void mpuInit() throws RuntimeIOException {
+    public void init() throws RuntimeIOException {
         // wake up device, Clear sleep bits bit (6), enable all sensors
         i2cDevice.writeByteData(PWR_MGMT_1, 0x80);
         SleepUtil.sleepMillis(100); // Wait for all registers to reset
@@ -129,13 +103,13 @@ public class IMU9255Driver implements DeviceInterface, IMU9255Constants, AK8963C
         // be higher than 1 / 0.0059 = 170 Hz
         // DLPF_CFG = bits 2:0 = 011; this limits the sample rate to 1000 Hz for both
         // With the MPU9250_Pi4j, it is possible to get gyro sample rates of 32 kHz (!), 8 kHz, or 1 kHz
-        i2cDevice.writeByteData(CONFIG, GT_DLPF.F01BW0041.bits);//set thermometer and gyro bandwidth to 41 and 42 Hz, respectively;
+        i2cDevice.writeByteData(CONFIG, MPU9255DLPBandwidth.F01BW0184.bits);//set thermometer and gyro bandwidth to 41 and 42 Hz, respectively;
 
         // Set sample rate = gyroscope output rate/(1 + SMPLRT_DIV)
-        i2cDevice.writeByteData(SMPLRT_DIV, SampleRateDiv.HZ200.bits);  // Use a 200 Hz rate; a rate consistent with the filter update rate
+        i2cDevice.writeByteData(SMPLRT_DIV, MPU9255SampleRateDiv.HZ200.bits);
+        // Use a 200 Hz rate; a rate consistent with the filter update rate
         // determined inset in CONFIG above
 
-        // The accelerometer, gyro, and thermometer are set to 1 kHz sample rates,
         // but all these rates are further reduced by a factor of 5 to 200 Hz because of the SMPLRT_DIV setting
 
         // Configure Interrupts and Bypass Enable
@@ -143,40 +117,172 @@ public class IMU9255Driver implements DeviceInterface, IMU9255Constants, AK8963C
         // clear on read of INT_STATUS, and enable I2C_BYPASS_EN so additional chips
         // can join the device bus and all can be controlled by the Arduino as master
         //ro.writeByteRegister(Registers.INT_PIN_CFG.getValue(), (byte)0x12);  // INT is 50 microsecond pulse and any read to clear
-        i2cDevice.writeByteData(INT_PIN_CFG, (byte)0x22);  // INT is 50 microsecond pulse and any read to clear - as per MPUBASICAHRS_T3
-        i2cDevice.writeByteData(INT_ENABLE, (byte)0x01);  // Enable data ready (bit 0) interrupt
+
+        i2cDevice.writeByteData(INT_PIN_CFG, (byte) 0x22);  // INT is 50 microsecond pulse and any read to clear - as per MPUBASICAHRS_T3
+        i2cDevice.writeByteData(INT_ENABLE, (byte) 0x01);  // Enable data ready (bit 0) interrupt
 
         /* Set to invalid values to ensure no I2C writes are skipped. */
-        sensors = (byte) 0xFF;
-        gyro_fsr = null;
+        gyroScaleRange = null;
         accel_fsr = null;
-        lpf = null;
         sample_rate = 0xFFFF;
-        fifo_enable = (byte) 0xFF;
-        bypass_mode = null;
-        compass_sample_rate = 0xFFFF;
-        /* mpu_set_sensors always preserves this setting. */
-        clk_src = ClockSource.INV_CLK_PLL;
-        /* Handled in next call to mpu_set_bypass. */
-        active_low_int = true;
-        latched_int = false;
-        int_motion_only = false;
-        lp_accel_mode = false;
+        magnetometerSampleRate = 0xFFFF;
+
         // memset(&st.chip_cfg.cache, 0, sizeof(st.chip_cfg.cache));
-        dmp_on = false;
-        dmp_loaded = false;
-        dmp_sample_rate = 0;
+        setGyroFullScaleRange(GyroFullScaleRange.INV_FSR_500DPS);
+        setAccelerometerScaleRange(AccelFullScaleRange.INV_FSR_16G);
 
-        setGyroFullScaleRange(GyroFullScaleRange.INV_FSR_2000DPS);
-        mpu_set_accel_fsr(AccelFullScaleRange.INV_FSR_2G);
-        setSampleRate(50);
+        setSampleRate(100);
+        setupMagnetometer();
+    }
 
-        // if (int_param)
-        // reg_int_cb(int_param);
+    /**
+     * setCalibrationMode9250 - puts the device into calibrate mode
+     *
+     * @throws InterruptedException - If sleep was interrupted
+     */
+    public void setCalibrationMode() throws InterruptedException {
+        Logger.info("Setting calibration mode.");
 
-        setupCompass();
-        mpuSetCompassSampleRate(10);
+        // get stable time source; Auto select clock source to be PLL gyroscope reference if ready
+        // else use the internal oscillator, bits 2:0 = 001
+        i2cDevice.writeByteData(PWR_MGMT_1, (byte) 0x01);
+        i2cDevice.writeByteData(PWR_MGMT_2, (byte) 0x00); //ALL Enabled
+        Thread.sleep(200);
 
+        // Configure device for bias calculation
+        i2cDevice.writeByteData(INT_ENABLE, (byte) 0x00);   // Disable all interrupts
+        i2cDevice.writeByteData(FIFO_EN, (byte) 0x00);      // Disable FIFO
+        i2cDevice.writeByteData(PWR_MGMT_1, (byte) 0x01);   // Turn on internal clock source
+        i2cDevice.writeByteData(I2C_MST_CTRL, (byte) 0x00); // Disable device master
+        //roMPU.writeByteRegister(Registers.USER_CTRL,(byte) 0x00);    // Disable FIFO and device master modes
+        //Thread.sleep(20);
+        i2cDevice.writeByteData(USER_CTRL, (byte) 0x0C);    // Reset FIFO and DMP NB the 0x08 bit is the DMP shown as reserved in docs
+
+        Thread.sleep(15);
+
+        i2cDevice.writeByteData(CONFIG, (byte) 1);       // Set low-pass filter to 188 Hz
+        i2cDevice.writeByteData(SMPLRT_DIV, (byte) 0);   // Set sample rate to 1 kHz = Internal_Sample_Rate / (1 + SMPLRT_DIV)
+    }
+
+    public float[] calibrateGyroscope(int samples) {
+        Logger.info("********* Gyroscope calibration. Samples count = " + samples);
+        // Assumes we are in calibration bits via setCalibrationMode9250();
+        // Set gyro full-scale to 250 degrees per second, maximum sensitivity
+        i2cDevice.writeByteData(GYRO_CONFIG, GyroFullScaleRange.INV_FSR_250DPS.getBitVal());
+
+        List<short[]> readings = new ArrayList<>();
+        for (int i = 0; i < samples; i++) {
+            ByteBuffer data = i2cDevice.readI2CBlockDataByteBuffer(GYRO_XOUT_H, 6);
+
+            short x = data.getShort();
+            short y = data.getShort();
+            short z = data.getShort();
+            readings.add(new short[]{x, y, z});
+            SleepUtil.sleepMillis(5);
+        }
+
+        int[] gyroBiasSum = new int[]{0, 0, 0}; //32 bit to allow for accumulation without overflow
+
+        for (short[] reading : readings) {
+            gyroBiasSum[0] += reading[0]; // Sum individual signed 16-bit biases to get accumulated signed 32-bit biases
+            gyroBiasSum[1] += reading[1];
+            gyroBiasSum[2] += reading[2];
+        }
+
+        Logger.info("Gyro bias sum: " + Arrays.toString(gyroBiasSum)
+                + String.format(" [0x%X, 0x%X, 0x%X]", gyroBiasSum[0], gyroBiasSum[1], gyroBiasSum[2]));
+
+        //calculate averages
+        short[] gyroBiasAvg = new short[]{0, 0, 0}; //16 bit average
+        if (readings.size() > 0) {
+            gyroBiasAvg[0] = (short) ((gyroBiasSum[0] / samples) & 0xffff); //mask out any sign extension
+            gyroBiasAvg[1] = (short) ((gyroBiasSum[1] / samples) & 0xffff);
+            gyroBiasAvg[2] = (short) ((gyroBiasSum[2] / samples) & 0xffff);
+        }
+        Logger.info("Gyro Bias average: " + Arrays.toString(gyroBiasAvg) +
+                String.format(" [0x%X, 0x%X, 0x%X]", gyroBiasAvg[0], gyroBiasAvg[1], gyroBiasAvg[2]));
+
+        this.gyroCalibration = new float[]{
+                (float) gyroBiasAvg[0],
+                (float) gyroBiasAvg[1],
+                (float) gyroBiasAvg[2]
+        };
+
+        Logger.info("********* End process of Gyro calibration. Values = " + Arrays.toString(gyroCalibration));
+
+        return gyroCalibration;
+    }
+
+    public float[] calibrateAccelerometer(int samples) {
+        // part of accel gyro cal MPU9250 in Kris Winer code - this code is only the Accelerometer elements
+        Logger.info("********* Accelerometer calibration. Samples count = " + samples);
+        i2cDevice.writeByteData(ACCEL_CONFIG, MPU9255AccScale.AFS_16G.bits); // Set accelerometer full-scale to 16 g, maximum sensitivity
+
+        List<short[]> readings = new ArrayList<>();
+        for (int i = 0; i < samples; i++) {
+
+            ByteBuffer data = i2cDevice.readI2CBlockDataByteBuffer(ACCEL_XOUT_H, 6); //TODO: need review
+            short x = data.getShort();
+            short y = data.getShort();
+            short z = data.getShort();
+            readings.add(new short[]{x, y, z});
+
+            SleepUtil.sleepMillis(2);
+        }
+
+        int[] accelBiasSum = new int[]{0, 0, 0}; //32 bit to allow for accumulation without overflow
+        for (short[] reading : readings) //#KW L962
+        {
+            accelBiasSum[0] += reading[0];        //#KW L972
+            accelBiasSum[1] += reading[1];    // Sum individual signed 16-bit biases to get accumulated signed 32-bit biases
+            accelBiasSum[2] += reading[2];
+        }
+        Logger.info("Accel Bias sum: " + Arrays.toString(accelBiasSum)
+                + String.format(" [0x%X, 0x%X, 0x%X]", accelBiasSum[0], accelBiasSum[1], accelBiasSum[2]));
+
+        //calculate averages
+        short[] accelBiasAvg = new short[]{0, 0, 0}; //16 bit average
+        accelBiasAvg[0] = (short) ((accelBiasSum[0] / samples) & 0xffff); // #KW L980
+        accelBiasAvg[1] = (short) ((accelBiasSum[1] / samples) & 0xffff); // Normalise sums to get average count biases
+        accelBiasAvg[2] = (short) ((accelBiasSum[2] / samples) & 0xffff);
+
+        if (accelBiasAvg[0] > 0)
+            accelBiasAvg[0] -= accel_fsr.getSensitivityScaleFactor(); // #KW 987 Remove gravity from the x-axis. Assume rocket in vertacal state
+        else accelBiasAvg[0] += accel_fsr.getSensitivityScaleFactor();
+
+        Logger.info("Accel bias average: " + Arrays.toString(accelBiasAvg) +
+                String.format(" [0x%X, 0x%X, 0x%X]", accelBiasAvg[0], accelBiasAvg[1], accelBiasAvg[2]));
+
+//        this.setDeviceBias(new Data3f( 	(float) accelBiasAvg [0] / 2.0f / (float)accelSensitivity,
+//                (float) accelBiasAvg [1] / 2.0f / (float)accelSensitivity,
+//                (float) accelBiasAvg [2] / 2.0f / (float)accelSensitivity)
+
+        this.accCalibration = new float[]{
+                (float) accelBiasAvg[0],
+                (float) accelBiasAvg[1],
+                (float) accelBiasAvg[2]
+        };
+
+        Logger.info("********* End Accelerometer calibration. Values = " + Arrays.toString(accCalibration));
+
+        return accCalibration;
+    }
+
+    /**
+     * Set the gyro full-scale range.
+     *
+     * @param fsr Desired full-scale range.
+     * @throws RuntimeIOException if an I/O error occurs
+     */
+    public void setGyroFullScaleRange(GyroFullScaleRange fsr) throws RuntimeIOException {
+        if (gyroScaleRange == fsr) {
+            return;
+        }
+
+        Logger.info("Setting gyro config to 0x%x%n", fsr.getBitVal());
+        // gyro_cfg == 0x1B == MPU9150_RA_GYRO_CONFIG
+        i2cDevice.writeByteData(GYRO_CONFIG, fsr.getBitVal());
+        gyroScaleRange = fsr;
     }
 
     /**
@@ -185,21 +291,18 @@ public class IMU9255Driver implements DeviceInterface, IMU9255Constants, AK8963C
      * @return Raw data in hardware units.
      * @throws RuntimeIOException if an I/O error occurs
      */
-    public short[] getGyroscopeData() throws RuntimeIOException {
-
+    public float[] readGyroscope() throws RuntimeIOException {
         // raw_gyro == 0x43 == MPU9150_RA_GYRO_XOUT_H
         ByteBuffer buffer = i2cDevice.readI2CBlockDataByteBuffer(GYRO_XOUT_H, 6);
         short x = buffer.getShort();
         short y = buffer.getShort();
         short z = buffer.getShort();
-        Logger.info("gyro reg values = (%d, %d, %d)%n", Short.valueOf(x), Short.valueOf(y), Short.valueOf(z));
-        /*
-         * byte[] data = readBytes(MPU9150_RA_GYRO_XOUT_H, 6) short x = (short)((data[0] << 8) |
-         * (data[1] & 0xff)); short y = (short)((data[2] << 8) | (data[3] & 0xff)); short z =
-         * (short)((data[4] << 8) | (data[5] & 0xff));
-         */
 
-        return new short[] { x, y, z };
+        return new float[]{
+                y - gyroCalibration[0], // NOTE: Swapped values Y and X
+                x - gyroCalibration[1],
+                z - gyroCalibration[2]
+        };
     }
 
     /**
@@ -211,19 +314,18 @@ public class IMU9255Driver implements DeviceInterface, IMU9255Constants, AK8963C
      * @return Raw data in hardware units.
      * @throws RuntimeIOException if an I/O error occurs
      */
-    public short[] mpu_get_accel_reg() throws RuntimeIOException {
+    public float[] readAccelerometer() throws RuntimeIOException {
         ByteBuffer buffer = i2cDevice.readI2CBlockDataByteBuffer(ACCEL_XOUT_H, 6);
+
         short x = buffer.getShort();
         short y = buffer.getShort();
         short z = buffer.getShort();
-		/*-
-		byte[] data = readBytes(MPU9150_RA_ACCEL_XOUT_H, 6);
-		short x = (short)((data[0] << 8) | (data[1] & 0xff));
-		short y = (short)((data[2] << 8) | (data[3] & 0xff));
-		short z = (short)((data[4] << 8) | (data[5] & 0xff));
-		*/
 
-        return new short[] { x, y, z };
+        return new float[]{
+                (x - accCalibration[0]),
+                (y - accCalibration[1]),
+                (z - accCalibration[2])
+        };
     }
 
     /**
@@ -236,76 +338,35 @@ public class IMU9255Driver implements DeviceInterface, IMU9255Constants, AK8963C
      * @return Temperature
      * @throws RuntimeIOException if an I/O error occurs
      */
-    public float getTemperature() throws RuntimeIOException {
-        if (sensors == 0) {
-            return -1;
-        }
+    public float readTemperature() throws RuntimeIOException {
         // temp == 0x41 == TEMP_OUT_H
         short raw = i2cDevice.readShort(TEMP_OUT_H);
         // raw = (tmp[0] << 8) | (tmp[1] & 0xff);
 
-        float val = ((raw - MPU6050_TEMP_OFFSET) / (float) MPU6050_TEMP_SENS) + 35;
         // float temperatureC = rawTemp / 333.87 + 21.0;
-        return val;
+        return ((raw) / 333.87f) + 15f;
     }
 
-    /**
-     * Get the gyro full-scale range.
-     *
-     * @return fsr Current full-scale range.
-     */
-    public GyroFullScaleRange mpu_get_gyro_fsr() {
-        return gyro_fsr;
-    }
-
-    /**
-     * Set the gyro full-scale range.
-     *
-     * @param fsr Desired full-scale range.
-     * @return status
-     * @throws RuntimeIOException if an I/O error occurs
-     */
-    public boolean setGyroFullScaleRange(GyroFullScaleRange fsr) throws RuntimeIOException {
-        if (sensors == 0) {
-            return false;
-        }
-
-        if (gyro_fsr == fsr) {
-            return true;
-        }
-
-        Logger.info("Setting gyro config to 0x%x%n", fsr.getBitVal());
-        // gyro_cfg == 0x1B == MPU9150_RA_GYRO_CONFIG
-        i2cDevice.writeByteData(GYRO_CONFIG, fsr.getBitVal());
-        gyro_fsr = fsr;
-
-        return true;
-    }
 
     /**
      * Set the accel full-scale range.
      *
      * @param fsr Desired full-scale range.
-     * @throws RuntimeIOException if an I/O error occurs
      * @return status
+     * @throws RuntimeIOException if an I/O error occurs
      */
-    public boolean mpu_set_accel_fsr(AccelFullScaleRange fsr) throws RuntimeIOException {
-        if (sensors == 0) {
-            return false;
-        }
-
+    public boolean setAccelerometerScaleRange(AccelFullScaleRange fsr) throws RuntimeIOException {
         if (accel_fsr == fsr) {
             return true;
         }
 
-        System.out.format("Setting accel config to 0x%x%n", Byte.valueOf(fsr.getBitVal()));
+        System.out.format("Setting accel config to 0x%x%n", fsr.getBitVal());
         // accel_cfg == 0x1C == MPU9150_RA_ACCEL_CONFIG
         i2cDevice.writeByteData(ACCEL_CONFIG, fsr.getBitVal());
         accel_fsr = fsr;
 
         return true;
     }
-
 
     public int getSampleRate() {
         return sample_rate;
@@ -315,19 +376,11 @@ public class IMU9255Driver implements DeviceInterface, IMU9255Constants, AK8963C
      * Set sampling rate. Sampling rate must be between 4Hz and 1kHz.
      *
      * @param rate Desired sampling rate (Hz).
-     * @throws RuntimeIOException if an I/O error occurs
      * @return status
+     * @throws RuntimeIOException if an I/O error occurs
      */
     public boolean setSampleRate(int rate) throws RuntimeIOException {
         Logger.debug("mpu_set_sample_rate({})", rate);
-        if (sensors == 0) {
-            return false;
-        }
-
-        if (dmp_on) {
-            Logger.warn("mpu_set_sample_rate() DMP is on, returning");
-            return false;
-        }
 
         int new_rate = rate;
         if (new_rate < 4) {
@@ -342,7 +395,7 @@ public class IMU9255Driver implements DeviceInterface, IMU9255Constants, AK8963C
         i2cDevice.writeByteData(SMPLRT_DIV, data);
 
         sample_rate = 1000 / (1 + data);
-        mpuSetCompassSampleRate(Math.min(compass_sample_rate, MAX_COMPASS_SAMPLE_RATE));
+        setMagnetometerSampleRate(Math.min(magnetometerSampleRate, MAX_COMPASS_SAMPLE_RATE));
 
         Logger.debug("Automatically setting LPF to {}", sample_rate >> 1);
         /* Automatically set LPF to 1/2 sampling rate. */
@@ -351,34 +404,31 @@ public class IMU9255Driver implements DeviceInterface, IMU9255Constants, AK8963C
         return true;
     }
 
-    public int mpu_get_compass_sample_rate() {
-        return compass_sample_rate;
+    public int getMagnetometerSampleRate() {
+        return magnetometerSampleRate;
     }
 
     /**
      * Set compass sampling rate. The compass on the auxiliary I2C bus is read by the MPU
      * hardware at a maximum of 100Hz. The actual rate can be set to a fraction of the gyro
      * sampling rate.
-     *
+     * <p>
      * WARNING: The new rate may be different than what was requested. Call
      * mpu_get_compass_sample_rate to check the actual setting.
      *
      * @param rate Desired compass sampling rate (Hz).
      * @throws RuntimeIOException if an I/O error occurs
-     * @return status
      */
-    public boolean mpuSetCompassSampleRate(int rate) throws RuntimeIOException {
-        Logger.debug("mpu_set_compass_sample_rate({})", rate);
+    public void setMagnetometerSampleRate(int rate) throws RuntimeIOException {
+        Logger.debug("setMagnetometerSampleRate({})", rate);
         if (rate == 0 || rate > sample_rate || rate > MAX_COMPASS_SAMPLE_RATE) {
-            return false;
+            return;
         }
 
         byte div = (byte) (sample_rate / rate - 1);
         // s4_ctrl == 0x34 == MPU9150_RA_I2C_SLV4_CTRL
-        i2cDevice.writeByteData(I2C_SLV4_CTRL, div);
-        compass_sample_rate = sample_rate / (div + 1);
-
-        return true;
+        i2cDeviceAK8963.writeByteData(I2C_SLV4_CTRL, div);
+        magnetometerSampleRate = sample_rate / (div + 1);
     }
 
     /**
@@ -386,7 +436,7 @@ public class IMU9255Driver implements DeviceInterface, IMU9255Constants, AK8963C
      *
      * @return Sensitivy, conversion from hardware units to dps.
      */
-    public double getGyroSensitivity() {
+    public double getGyroScale() {
         /*
          * float sens; switch (gyro_fsr) { case INV_FSR_250DPS: sens = 131.0f; break; case
          * INV_FSR_500DPS: sens = 65.5f; break; case INV_FSR_1000DPS: sens = 32.8f; break; case
@@ -394,7 +444,7 @@ public class IMU9255Driver implements DeviceInterface, IMU9255Constants, AK8963C
          *
          * return sens;
          */
-        return gyro_fsr.getSensitivityScaleFactor();
+        return gyroScaleRange.getScale();
     }
 
     /**
@@ -402,137 +452,64 @@ public class IMU9255Driver implements DeviceInterface, IMU9255Constants, AK8963C
      *
      * @return Sensitivity. Conversion from hardware units to g's.
      */
-    public int mpu_get_accel_sens() {
+    public double getAccelerometerScale() {
         /*
          * int sens; switch (accel_fsr) { case INV_FSR_2G: sens = 16384; break; case INV_FSR_4G:
          * sens = 8192; break; case INV_FSR_8G: sens = 4096; break; case INV_FSR_16G: sens = 2048;
          * break; default: return -1; }
          */
-        return accel_fsr.getSensitivityScaleFactor();
+        return accel_fsr.getScale();
     }
 
-    /**
-     * Get current FIFO configuration. sensors can contain a combination of the following
-     * flags: INV_X_GYRO, INV_Y_GYRO, INV_Z_GYRO INV_XYZ_GYRO INV_XYZ_ACCEL
-     *
-     * @return sensors Mask of sensors in FIFO.
-     */
-    public byte mpu_get_fifo_config() {
-        return fifo_enable;
+    public float getMagnetometerScale() {
+        return magScale.res;
     }
 
-    /**
-     * Get current power state.
-     *
-     * @return power_on 1 if turned on, 0 if suspended.
-     */
-    public boolean mpu_get_power_state() {
-        if (sensors != 0) {
-            return true;
-        }
-        return false;
-    }
-
-    /**
-     * Set interrupt level.
-     *
-     * @param active_low 1 for active low, 0 for active high.
-     */
-    public void mpu_set_int_level(boolean active_low) {
-        active_low_int = active_low;
-    }
-
-    public float[] get_accel_prod_shift() throws RuntimeIOException {
-        byte[] tmp = new byte[4];
-        i2cDevice.readI2CBlockData(0x0D, tmp);
-        // if (i2c_read(st.hw->addr, 0x0D, 4, tmp))
-        // return 0x07;
-
-        float[] st_shift = new float[3];
-        byte[] shift_code = new byte[3];
-        shift_code[0] = (byte) (((tmp[0] & 0xE0) >> 3) | ((tmp[3] & 0x30) >> 4));
-        shift_code[1] = (byte) (((tmp[1] & 0xE0) >> 3) | ((tmp[3] & 0x0C) >> 2));
-        shift_code[2] = (byte) (((tmp[2] & 0xE0) >> 3) | (tmp[3] & 0x03));
-        for (int ii = 0; ii < 3; ii++) {
-            if (shift_code[ii] == 0) {
-                st_shift[ii] = 0.f;
-                continue;
-            }
-            /*
-             * Equivalent to.. st_shift[ii] = 0.34f * powf(0.92f/0.34f, (shift_code[ii]-1) / 30.f)
-             */
-            st_shift[ii] = 0.34f;
-            while (--shift_code[ii] != 0) {
-                st_shift[ii] *= 1.034f;
-            }
-        }
-        return st_shift;
-    }
-
-    public void get_st_biases() throws RuntimeIOException {
-        // TODO Implementation
-        Logger.error("get_st_biases NOT IMPLEMENTED!");
-    }
-
-
-    /**
-     * Get DMP state.
-     *
-     * @return enabled true if enabled.
-     */
-    public boolean mpu_get_dmp_state() {
-        return dmp_on;
-    }
-
-    /* This initialisation is similar to the one in ak8975.c. */
-    public boolean setupCompass() throws RuntimeIOException {
-
-        Logger.info("Configure Magnetometer AK8963");
+    public void setupMagnetometer() throws RuntimeIOException {
+        Logger.debug("Configure Magnetometer AK8963");
 
         // First extract the factory calibration for each magnetometer axis
-        i2cDevice.writeByteData(AK8963_CNTL1,(byte) 0x00); // #KW 836 Power down magnetometer
+        i2cDeviceAK8963.writeByteData(AK8963_CNTL1, (byte) 0x00); // #KW 836 Power down magnetometer
         SleepUtil.sleepMillis(10);
 
-        i2cDevice.writeByteData(AK8963_CNTL1, (byte)0x0F); // #KW 838 Enter Fuse ROM access bits
+        i2cDeviceAK8963.writeByteData(AK8963_CNTL1, (byte) 0x0F); // #KW 838 Enter Fuse ROM access bits
         SleepUtil.sleepMillis(10);
 
-        byte calibrationValues[] = i2cDevice.readI2CBlockDataByteArray(AK8963_ASAX, 3);  // Read the x-, y-, and z-axis calibration values
-        this.magCalibration = new float[]{
+        byte[] calibrationValues = i2cDeviceAK8963.readI2CBlockDataByteArray(AK8963_ASAX, 3);  // Read the x-, y-, and z-axis calibration values
+        this.magFactoryCalibration = new float[]{
                 ((float) (calibrationValues[0] - 128)) / 256f + 1f,   // #KW 841-843 Return x-axis sensitivity adjustment values, etc.
                 ((float) (calibrationValues[1] - 128)) / 256f + 1f,
                 ((float) (calibrationValues[2] - 128)) / 256f + 1f
         };
 
-        i2cDevice.writeByteData(AK8963_CNTL1, (byte) 0x00); // #KW 844 Power down magnetometer
+        i2cDeviceAK8963.writeByteData(AK8963_CNTL1, (byte) 0x00); // #KW 844 Power down magnetometer
         SleepUtil.sleepMillis(10);
+
         // Configure the magnetometer for continuous read and highest resolution
         // set Mscale bit 4 to 1 (0) to enable 16 (14) bit resolution in CNTL1 register,
         // and enable continuous bits data acquisition Mmode (bits [3:0]), 0010 for 8 Hz and 0110 for 100 Hz sample rates
         // set to MagScale.MFS_16BIT.bits and MagMode.MM_100HZ set as final lines 48 & 49. register write should be 0x16
 
-        i2cDevice.writeByte(AK8963_CNTL1, (byte)(magScale.bits | magMode.bits)); // #KW 849 Set magnetometer data resolution and sample ODR ####16bit already shifted
+        i2cDeviceAK8963.writeByteData(AK8963_CNTL1, (byte) (magScale.bits | magMode.bits)); // #KW 849 Set magnetometer data resolution and sample ODR ####16bit already shifted
         SleepUtil.sleepMillis(10);
     }
 
     /**
-     * Read raw compass data.
-     *
-     * NOTE: Uncalibrated
+     * Read calibrated compass data.
      *
      * @return data Raw data in hardware units.
      * @throws RuntimeIOException if an I/O error occurs
      */
-    public short[] mpu_get_compass_reg() throws RuntimeIOException {
-        byte dataReady = (byte) (i2cDevice.readByteData(AK8963_ST1) & 0x01); //DRDY - Data ready bit0 1 = data is ready
+    public float[] readMagnetometer() throws RuntimeIOException {
+        byte dataReady = (byte) (i2cDeviceAK8963.readByteData(AK8963_ST1) & 0x01); //DRDY - Data ready bit0 1 = data is ready
         if (dataReady == 0) throw new RuntimeIOException("Not ready");
 
-        short magX, magY, magZ;
+        float magX, magY, magZ;
 
         // #KW 494 readMagData - data is ready, read it NB bug fix here read was starting from ST1 not XOUT_L
-        byte[] buffer = i2cDevice.readI2CBlockDataByteArray(AK8963_XOUT_L, 7); // #KW L815 6 data bytes x,y,z 16 bits stored as little Endian (L/H)
+        byte[] buffer = i2cDeviceAK8963.readI2CBlockDataByteArray(AK8963_XOUT_L, 7); // #KW L815 6 data bytes x,y,z 16 bits stored as little Endian (L/H)
         // Check if magnetic sensor overflow set, if not then report data
         //roAK.readByteRegister(Registers.AK8963_ST2);// Data overflow bit 3 and data read error status bit 2
-
 
         byte status2 = buffer[6]; // Status2 register must be read as part of data read to show device data has been read
         if ((status2 & 0x08) == 0) //#KW 817 bit3 HOFL: Magnetic sensor overflow is normal (no Overflow), data is valid
@@ -544,58 +521,93 @@ public class IMU9255Driver implements DeviceInterface, IMU9255Constants, AK8963C
             //the stored calibration results is applied here as there is no hardware correction stored in the hardware via calibration
             //#KW L496-L501. scale() does the multiplication by magScale L499-501
 
-//            lastCalibratedReading = scale(new TimestampedData3f(	lastRawMagX*magScale.res*magCalibration.getX() - getDeviceBias().getX(),
-//                    lastRawMagY*magScale.res*magCalibration.getY() - getDeviceBias().getY(),
-//                    lastRawMagZ*magScale.res*magCalibration.getZ() - getDeviceBias().getZ()));
-//            this.addValue(lastCalibratedReading); //store the result
-
-            return new short[]{magX, magY, magZ};
+            return new float[]{
+                    (magX * magFactoryCalibration[0] - getMagCalibration()[0]),
+                    (magY * magFactoryCalibration[1] - getMagCalibration()[1]),
+                    (magZ * magFactoryCalibration[2] - getMagCalibration()[2])
+            };
         }
 
-        return new short[]{0, 0, 0}; //TODO: check if it's correct behaviour
+        return new float[]{0, 0, 0}; //TODO: check if it's correct behaviour
     }
 
-    /**
-     * Get the compass measurement range.
-     *
-     * @return fsr Current full-scale range.
-     */
-    public int getCompassFSR() {
-        return AK8963_M_RANGE;
+    public float[] calibrateMagnetometer() throws InterruptedException {
+        Logger.info("********* Calibrating Magnetometer AK8963");
+
+        float[] bias = {0.0f, 0.0f, 0.0f}, scale = {0, 0, 0};
+        float[] max = {(short) -32767, (short) -32767, (short) -32767},
+                min = {(short) 32767, (short) 32767, (short) 32767},
+                temp = {0, 0, 0};
+
+        Logger.info("Magnetometer Calibration: Wave device in a figure '8' until done!");
+        // #KW L1073 shoot for ~fifteen seconds of mag data
+        for (int i = 0; i < magMode.sampleCount; i++) {
+            float[] magn = readMagnetometer();
+
+            temp[0] = magn[0];
+            temp[1] = magn[1];
+            temp[2] = magn[2];
+
+            for (int j = 0; j < 3; j++) {
+                if (temp[j] > max[j]) max[j] = temp[j];
+                if (temp[j] < min[j]) min[j] = temp[j];
+            }
+            if (magMode == AK8963MagMode.MM_8HZ)
+                SleepUtil.sleepMillis(135);  // at 8 Hz ODR, new mag data is available every 125 ms
+            if (magMode == AK8963MagMode.MM_100HZ)
+                SleepUtil.sleepMillis(10);  // at 100 Hz ODR, new mag data is available every 10 ms
+        }
+
+        bias[0] = (max[0] + min[0]) / 2;  // get average x mag bias in counts
+        bias[1] = (max[1] + min[1]) / 2;  // get average y mag bias in counts
+        bias[2] = (max[2] + min[2]) / 2;  // get average z mag bias in counts
+
+        this.magCalibration = new float[]{
+                bias[0] * magFactoryCalibration[0],
+                bias[1] * magFactoryCalibration[1],
+                bias[2] * magFactoryCalibration[2]
+        };
+
+        // #KW L1099 Get soft iron correction estimate
+        scale[0] = (max[0] - min[0]) / 2;  // get average x axis max chord length in counts
+        scale[1] = (max[1] - min[1]) / 2;  // get average y axis max chord length in counts
+        scale[2] = (max[2] - min[2]) / 2;  // get average z axis max chord length in counts
+
+        float avgRad = (scale[0] + scale[1] + scale[2]) / 3.0f; // #KW L1104-5
+
+        Logger.info("Magnetometer Biases (hard): " + Arrays.toString(bias));
+        Logger.info("Magnetometer Biases (soft): " + Arrays.toString(scale));
+
+//        this.setDeviceScaling(new Data3f(avgRad / ((float) scale[0]), // #KW L1107-9 save mag scale for main program
+//                avgRad / ((float) scale[1]), // deviceScale was pass by ref dest2 in Kris Winer code
+//                avgRad / ((float) scale[2])));
+
+        Logger.info("****** Magnetometer calibration finished. Values = " + Arrays.toString(magCalibration));
+
+        return this.magCalibration;
     }
 
-    /**
-     * Enters LP accel motion interrupt mode. The behaviour of this feature is very different
-     * between the MPU6050 and the MPU6500. Each chip's version of this feature is explained
-     * below.
-     *
-     * The hardware motion threshold can be between 32mg and 8160mg in 32mg increments.
-     *
-     * Low-power accel mode supports the following frequencies: 1.25Hz, 5Hz, 20Hz, 40Hz
-     *
-     * MPU6500: Unlike the MPU6050 version, the hardware does not "lock in" a reference
-     * sample. The hardware monitors the accel data and detects any large change over a short
-     * period of time.
-     *
-     * The hardware motion threshold can be between 4mg and 1020mg in 4mg increments.
-     *
-     * MPU6500 Low-power accel mode supports the following frequencies: 1.25Hz, 2.5Hz, 5Hz,
-     * 10Hz, 20Hz, 40Hz, 80Hz, 160Hz, 320Hz, 640Hz
-     *
-     * NOTES: The driver will round down thresh to the nearest supported value if an
-     * unsupported threshold is selected. To select a fractional wake-up frequency, round down
-     * the value passed to lpa_freq. The MPU6500 does not support a delay parameter. If this
-     * function is used for the MPU6500, the value passed to time will be ignored. To disable
-     * this mode, set lpa_freq to zero. The driver will restore the previous configuration.
-     *
-     * @param thresh   Motion threshold in mg.
-     * @param time     Duration in milliseconds that the accel data must exceed thresh before
-     *                 motion is reported.
-     * @param lpa_freq Minimum sampling rate, or zero to disable.
-     * @throws RuntimeIOException if an I/O error occurs
-     */
-    public void mpu_lp_motion_interrupt(int thresh, int time, int lpa_freq) throws RuntimeIOException {
-        // TODO Implementation
-        Logger.error("mpu_lp_motion_interrupt NOT IMPLEMENTED!");
+    public void setMagCalibration(float[] magCalibration) {
+        this.magCalibration = magCalibration;
+    }
+
+    public void setGyroCalibration(float[] gyroCalibration) {
+        this.gyroCalibration = gyroCalibration;
+    }
+
+    public void setAccCalibration(float[] accCalibration) {
+        this.accCalibration = accCalibration;
+    }
+
+    public float[] getMagCalibration() {
+        return magCalibration;
+    }
+
+    public float[] getGyroCalibration() {
+        return gyroCalibration;
+    }
+
+    public float[] getAccCalibration() {
+        return accCalibration;
     }
 }

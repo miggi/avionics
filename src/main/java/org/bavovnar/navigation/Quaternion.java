@@ -1,9 +1,7 @@
-package inertialNavigation;
+package org.bavovnar.navigation;
 
+import org.bavovnar.core.legacy.TimestampedData3f;
 import java.io.Serializable;
-
-import dataTypes.Data3f;
-import dataTypes.TimestampedData3f;
 
 /**
  * Quaternion - w simple 4 value data aClass used for navigation calculations
@@ -16,19 +14,13 @@ import dataTypes.TimestampedData3f;
  */
 public class Quaternion implements Serializable
 {
-	/**
-	 * 
-	 */
 	private static final long serialVersionUID = -1595546505762109406L;
-	/**
-	 * 
-	 */
 	public float w,x,y,z;
 	
 	/**
 	 * Quaternion	- Constructor from 4 scalar values
      */
-	public Quaternion(float a,float b, float c, float d)
+	public Quaternion(float a, float b, float c, float d)
 	{
 		this.w = a;
 		this.x = b;
@@ -42,7 +34,7 @@ public class Quaternion implements Serializable
 	 * @param pitch	-	angle from horizontal plane of front face in radians
 	 * @param roll	-	angle from horizontal plane of side face in radians
 	 */
-	public Quaternion( float yaw,float pitch, float roll)
+	public Quaternion(float yaw, float pitch, float roll)
 	{
 		float t0 = (float)Math.cos(yaw * 0.5f);
 		float t1 = (float)Math.sin(yaw * 0.5f);
@@ -107,8 +99,8 @@ public class Quaternion implements Serializable
 	    float a32 =   2.0f * (x * z - w * y);
 	    float a33 =   w * w - x * x - y * y + z * z;
 	    
-		//a32 = a32 > 1.0f ? 1.0f : a32;		//Deal with singularity
-		//a32 = a32 < -1.0f ? -1.0f : a32;	//Deal with singularity
+		// a32 = a32 > 1.0f ? 1.0f : a32;		//Deal with singularity
+		// a32 = a32 < -1.0f ? -1.0f : a32;	//Deal with singularity
 	    
 	    float pitch = (float) -Math.asin(a32);					// #KW L630
 	    float roll  = (float) Math.atan2(a31, a33);

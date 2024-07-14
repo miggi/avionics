@@ -1,4 +1,4 @@
-package org.bavovnar.device;
+package org.bavovnar.device.checking;
 
 import com.diozero.api.RuntimeIOException;
 import com.diozero.devices.BMP180;
@@ -6,7 +6,7 @@ import com.diozero.util.SleepUtil;
 import org.tinylog.Logger;
 
 public class BMP180Test {
-    private static final int ITERATIONS = 20;
+    private static final int ITERATIONS = 200;
 
     public static void main(String[] args) {
         int controller = 1;

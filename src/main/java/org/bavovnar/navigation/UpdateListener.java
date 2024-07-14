@@ -1,2 +1,6 @@
-package org.bavovnar.navigation;public interface UpdateListener {
+package org.bavovnar.navigation;
+
+public interface UpdateListener
+{
+    void dataUpdated();
 }

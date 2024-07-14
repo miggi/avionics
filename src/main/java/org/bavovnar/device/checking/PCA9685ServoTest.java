@@ -1,10 +1,9 @@
-package org.bavovnar.device;
+package org.bavovnar.device.checking;
 
 import com.diozero.api.ServoDevice;
 import com.diozero.api.ServoTrim;
 import com.diozero.devices.PCA9685;
 import com.diozero.util.SleepUtil;
-
 import org.tinylog.Logger;
 
 public class PCA9685ServoTest {

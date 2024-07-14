@@ -1,6 +1,6 @@
-package org.bavovnar.registers;
+package org.bavovnar.device.constants;
 
-public enum SampleRateDiv {
+public enum MPU9255SampleRateDiv {
     NONE((byte) 0, 1000),  //rates given are for a 1KHz base rate, for other base frequencies calculate accordingly
     HZ200((byte) 4, 200),
     HZ100((byte) 9, 100),
@@ -8,11 +8,11 @@ public enum SampleRateDiv {
     HZ010((byte) 99, 10),
     HZ001((byte) 999, 1);
 
-    final byte bits;
-    final int rate1KHz;
-    final static byte bitMask = (byte) 0xFF;
+    public final byte bits;
+    public final int rate1KHz;
+    public final static byte bitMask = (byte) 0xFF;
 
-    SampleRateDiv(byte bits, int rate) {
+    MPU9255SampleRateDiv(byte bits, int rate) {
         this.bits = bits;
         this.rate1KHz = rate;
     }

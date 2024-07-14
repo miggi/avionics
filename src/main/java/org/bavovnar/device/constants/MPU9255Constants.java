@@ -1,6 +1,6 @@
 package org.bavovnar.device.constants;
 
-public interface IMU9255Constants {
+public interface MPU9255Constants {
 
     public static final int MPU9255_ADDRESS = 0x68; // i2c bus address
 

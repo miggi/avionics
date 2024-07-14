@@ -1,4 +1,4 @@
-package dataTypes;
+package org.bavovnar.core.legacy;
 
 import java.io.Serializable;
 
